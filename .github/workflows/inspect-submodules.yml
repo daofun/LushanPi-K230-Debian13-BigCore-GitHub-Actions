@@ -1,0 +1,137 @@
+name: Inspect K230 SDK submodules
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install git-lfs and dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq git-lfs
+          git lfs install
+
+      - name: Clone SDK fully (no shallow)
+        run: |
+          set -ex
+          echo "=== Cloning SDK (full, recursive) ==="
+          # 不用 --depth=1，避免漏掉 submodule 信息
+          git clone https://github.com/kendryte/k230_linux_sdk.git k230_sdk
+          cd k230_sdk
+          echo "=== HEAD commit ==="
+          git log -1 --format='%H %s'
+          echo "=== default branch ==="
+          git branch -a
+          echo "=== submodule status (raw) ==="
+          # 用 cat 而不是 git submodule status，避免子模块没注册时报错
+          cat .gitmodules 2>/dev/null || echo "(NO .gitmodules FILE)"
+
+      - name: Read .gitmodules contents
+        run: |
+          set -ex
+          cd k230_sdk
+          echo "========== .gitmodules raw dump =========="
+          if [ -f .gitmodules ]; then
+            cat .gitmodules
+          else
+            echo "NO .gitmodules — this repo has NO submodules declared"
+          fi
+
+      - name: Inspect submodules declared vs actually cloned
+        run: |
+          set -ex
+          cd k230_sdk
+          echo "=== ls-files (git tracked paths, no submodule fetch) ==="
+          # 列出所有被 git 记录的路径，看看子模块在 index 里是怎么声明的
+          git ls-files | head -60
+          echo ""
+          echo "=== git ls-tree (show submodule commits) ==="
+          # 子模块在 tree 里是以 commit 对象存在的，能看出哪些路径是 submodule
+          git ls-tree -r HEAD | grep "^160000" || echo "(no submodule entries in tree)"
+          echo ""
+          echo "=== diff against empty (all tracked paths by type) ==="
+          git ls-tree -r HEAD | awk '{print $2}' | sort | uniq -c | sort -rn | head -20
+
+      - name: Try submodule update and capture failure
+        run: |
+          set +e
+          cd k230_sdk
+          echo "=== attempt: git submodule update --init --recursive ==="
+          # 故意不 set -e，捕获真实错误原因
+          timeout 300 git submodule update --init --recursive 2>&1 | tee /tmp/submod.log
+          echo "exit code: ${PIPESTATUS[0]}"
+          echo ""
+          echo "=== tail of submodule update log ==="
+          tail -30 /tmp/submod.log
+
+      - name: Compare: what SHOULD exist vs what DOES exist
+        run: |
+          set -ex
+          cd k230_sdk
+          echo "========== declared submodule paths =========="
+          # 从 .gitmodules 提取所有 path=
+          grep -E "^\s*path\s*=" .gitmodules 2>/dev/null | sed 's/.*path = //' | while read p; do
+            echo "--- submodule path: $p ---"
+            if [ -d "$p" ]; then
+              echo "  EXISTS, contents:"
+              ls -la "$p" | head -5
+              echo "  git status of $p:"
+              git -C "$p" status 2>&1 | head -5 || echo "  (not a git repo / empty)"
+            else
+              echo "  MISSING — directory does not exist"
+            fi
+          done
+
+      - name: Find every defconfig in the repo
+        run: |
+          set -ex
+          cd k230_sdk
+          echo "========== all *_defconfig files (top 80) =========="
+          find . -name "*_defconfig" -not -path "./.git/*" 2>/dev/null | sort | head -80
+          echo ""
+          echo "=== defconfigs matching lckfb / lushan / canmv ==="
+          find . -name "*defconfig" -not -path "./.git/*" 2>/dev/null | grep -iE "lckfb|lushan|canmv" | sort
+
+      - name: Check Makefile sync target
+        run: |
+          set -ex
+          cd k230_sdk
+          echo "========== Makefile (full) =========="
+          cat Makefile
+          echo ""
+          echo "=== make sync dry-run (just show what it would do) ==="
+          # 用 -n 做 dry-run，不实际下载，只看它会执行什么
+          make -n sync 2>&1 | head -40 || echo "(make -n sync failed)"
+
+      - name: Check toolchain and board directories
+        run: |
+          set -ex
+          cd k230_sdk
+          echo "=== toolchain/ ==="
+          ls -la toolchain/ 2>/dev/null || echo "MISSING"
+          echo ""
+          echo "=== board/ ==="
+          ls -la board/ 2>/dev/null || echo "MISSING"
+          echo ""
+          echo "=== any toolchain tarballs in dl/ or output/ ==="
+          find . -name "*.tar.*" -not -path "./.git/*" 2>/dev/null | head -20
+          echo ""
+          echo "=== dl/ ==="
+          ls -la dl/ 2>/dev/null || echo "MISSING/empty"
+
+      - name: Check genimage and default.env locations
+        run: |
+          set -ex
+          cd k230_sdk
+          echo "=== genimage configs ==="
+          find . -name "genimage*.cfg" -not -path "./.git/*" 2>/dev/null | sort
+          echo ""
+          echo "=== default.env ==="
+          find . -name "default.env" -not -path "./.git/*" 2>/dev/null | sort
+          echo ""
+          echo "=== board/ tree (if exists) ==="
+          ls -laR board/ 2>/dev/null | head -60 || echo "board/ MISSING"
