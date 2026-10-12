@@ -1,0 +1,83 @@
+name: Inspect K230 SDK structure
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'inspect-sdk.yml'
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install git lfs
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq git-lfs
+          git lfs install
+
+      - name: Clone SDK (full history + submodules)
+        run: |
+          set -ex
+          echo "=== Cloning SDK ==="
+          # 不用 --depth=1，避免漏掉 submodule / 分支信息
+          git clone --recursive https://github.com/kendryte/k230_linux_sdk.git k230_sdk
+          cd k230_sdk
+          echo "=== HEAD commit ==="
+          git log -1 --format='%H %s'
+          echo "=== remotes / branches ==="
+          git branch -a | head -30
+          echo "=== submodules ==="
+          git submodule status || echo "(no submodules)"
+
+      - name: Dump SDK structure
+        run: |
+          set -ex
+          cd k230_sdk
+
+          echo "========== 1. top-level ls -la =========="
+          ls -la
+
+          echo "========== 2. tools/ full tree =========="
+          ls -laR tools/ 2>/dev/null || echo "tools/ missing"
+
+          echo "========== 3. Does get_download_url.sh exist anywhere? =========="
+          find . -name "get_download_url.sh" -not -path "./.git/*" 2>/dev/null || echo "NOT FOUND"
+
+          echo "========== 4. configs/ =========="
+          ls -la configs/ 2>/dev/null || echo "configs/ missing"
+
+          echo "========== 5. find all defconfigs =========="
+          find . -name "*defconfig" -not -path "./.git/*" 2>/dev/null | sort || echo "NONE"
+
+          echo "========== 6. find genimage configs =========="
+          find . -name "*genimage*" -not -path "./.git/*" 2>/dev/null | sort || echo "NONE"
+
+          echo "========== 7. find default.env =========="
+          find . -name "default.env" -not -path "./.git/*" 2>/dev/null | sort || echo "NONE"
+
+          echo "========== 8. Makefile targets (make help) =========="
+          make help 2>&1 | head -80 || echo "make help failed"
+
+          echo "========== 9. Makefile targets (manual scan) =========="
+          grep -E "^[a-zA-Z0-9_%-]+:" Makefile 2>/dev/null | head -60 || echo "no targets in root Makefile"
+
+          echo "========== 10. grep prepare/source/debian targets =========="
+          grep -nE "prepare_sourcecode|prepare_tools|\bsource\b|\bdebian\b|\bubuntu\b" Makefile 2>/dev/null | head -40 || echo "no match"
+
+          echo "========== 11. board/ =========="
+          ls -la board/ 2>/dev/null | head -40 || echo "board/ missing"
+
+          echo "========== 12. toolchain/ =========="
+          ls -la toolchain/ 2>/dev/null | head -20 || echo "toolchain/ missing / empty"
+
+          echo "========== 13. docs/ =========="
+          ls -la docs/ 2>/dev/null | head -20 || echo "docs/ missing"
+
+          echo "========== 14. total size =========="
+          du -sh . 2>/dev/null
+          du -sh */ 2>/dev/null | sort -h | tail -15
