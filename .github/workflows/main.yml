@@ -329,11 +329,39 @@ jobs:
           sudo docker --version
           sudo docker info --format '{{.ServerVersion}}' || true
 
+      - name: Patch Dockerfile to use Aliyun mirror (fix 403 from tuna)
+        run: |
+          cd k230_sdk
+          echo ">>> Checking Dockerfile mirror settings..."
+          echo "--- Current sources.list lines in Dockerfile ---"
+          grep -n "mirrors\.\|sources\.list" tools/docker/Dockerfile || echo "(no mirror sed found)"
+
+          # 清华源/中科大源对境外 IP 返回 403 Forbidden，GitHub Actions runner 在境外
+          # 必须替换为阿里云（对境外 IP 无限制）
+          echo ">>> Patching Dockerfile: tuna/ustc -> aliyun..."
+          # 处理各种可能的写法：tuna、ustc、tsinghua
+          sed -i 's|mirrors.tuna.tsinghua.edu.cn|mirrors.aliyun.com|g' tools/docker/Dockerfile
+          sed -i 's|mirrors.ustc.edu.cn|mirrors.aliyun.com|g' tools/docker/Dockerfile
+          sed -i 's|archive.ubuntu.com|mirrors.aliyun.com|g' tools/docker/Dockerfile
+          sed -i 's|security.ubuntu.com|mirrors.aliyun.com|g' tools/docker/Dockerfile
+
+          echo "--- Patched Dockerfile ---"
+          grep -n "mirrors\.\|sources\.list\|apt-get" tools/docker/Dockerfile || echo "(check above)"
+
       - name: Build SDK Docker image
         run: |
           cd k230_sdk
-          echo ">>> Building K230 SDK Docker image..."
-          sudo docker build -f tools/docker/Dockerfile -t k230_builder tools/docker
+          echo ">>> Building K230 SDK Docker image (with aliyun mirror)..."
+
+          # 境外 runner 拉取 Docker Hub 基础镜像可能慢，加长 pull 超时
+          sudo docker build \
+            --network=host \
+            -f tools/docker/Dockerfile \
+            -t k230_builder \
+            tools/docker
+
+          echo ">>> Docker image built successfully:"
+          sudo docker images k230_builder
 
       # ---- 关键修复 1：Docker 挂载改为固定 /build，不再依赖容器内 $(pwd) ----
       # ---- 关键修复 2：每个 docker run 加 set -ex，让容器内真实输出可见 ----
@@ -353,6 +381,7 @@ jobs:
             -u root \
             -v "${SDK_DIR}:${BUILD_ROOT}" \
             -w "${BUILD_ROOT}" \
+            -e DEBIAN_FRONTEND=noninteractive \
             k230_builder \
             bash -c 'set -ex
               echo "=== container pwd ==="
@@ -362,9 +391,22 @@ jobs:
               echo "=== sourcing get_download_url.sh ==="
               source tools/get_download_url.sh
               echo "=== get_download_url.sh sourced OK ==="
-              echo "=== starting make prepare_sourcecode ==="
-              make prepare_sourcecode
-              echo "=== make prepare_sourcecode exit code: $? ==="
+
+              # 境外 runner 下载 SDK 源码包不稳定，失败自动重试 3 次
+              echo "=== starting make prepare_sourcecode (with retry) ==="
+              for i in 1 2 3; do
+                echo "--- attempt $i/3 ---"
+                if make prepare_sourcecode; then
+                  echo "=== make prepare_sourcecode succeeded on attempt $i ==="
+                  break
+                fi
+                echo "--- attempt $i failed, waiting 30s before retry ---"
+                sleep 30
+                if [ "$i" = "3" ]; then
+                  echo "=== make prepare_sourcecode FAILED after 3 attempts ==="
+                  exit 1
+                fi
+              done
             '
 
           echo ">>> After prepare_sourcecode, host view:"
@@ -377,11 +419,17 @@ jobs:
           echo ">>> Configuring SDK with: ${DEFCONFIG}"
           echo "Host SDK dir: ${SDK_DIR}"
 
+          # 检查 defconfig 文件是否存在（SDK 仓库内 configs/ 目录）
+          echo "--- Looking for ${DEFCONFIG} in SDK ---"
+          find "${SDK_DIR}" -name "${DEFCONFIG}" -not -path "*/output/*" 2>/dev/null | head -5
+          ls -la "${SDK_DIR}/configs/" 2>/dev/null | grep -i "${DEFCONFIG}" || echo "(not found in configs/)"
+
           sudo docker run --rm \
             -u root \
             -v "${SDK_DIR}:${BUILD_ROOT}" \
             -v "${SDK_DIR}/toolchain:${TOOLCHAIN_DIR}" \
             -w "${BUILD_ROOT}" \
+            -e DEBIAN_FRONTEND=noninteractive \
             k230_builder \
             bash -c 'set -ex
               echo "=== container pwd ==="
@@ -389,12 +437,18 @@ jobs:
               echo "=== make CONF=${DEFCONFIG} ==="
               make CONF=${DEFCONFIG}
               echo "=== make CONF exit code: $? ==="
+              echo "=== output after CONF ==="
+              ls -la output/ 2>/dev/null || echo "(output/ missing)"
             '
 
           echo ">>> After configure, host view of output/:"
           ls -la "${SDK_DIR}/output/" 2>/dev/null || echo "(output/ does not exist)"
           if [ -d "${SDK_DIR}/output/${DEFCONFIG}" ]; then
             ls -la "${SDK_DIR}/output/${DEFCONFIG}/"
+          else
+            echo "❌ output/${DEFCONFIG}/ still missing after configure!"
+            echo "--- full output/ tree ---"
+            find "${SDK_DIR}/output" -maxdepth 3 2>/dev/null | sort || echo "(empty)"
           fi
 
       # ---- 关键修复 3：去掉 -j$(nproc)，SDK 内部并行会出问题 ----
@@ -445,6 +499,46 @@ jobs:
           tar -tzf "${ARTIFACT_DIR}/debian13_rootfs.ext4.tar.gz" | head -5
           echo "✅ tarball OK"
 
+      - name: Verify SDK build output
+        run: |
+          set -e
+          cd k230_sdk
+          DEFCONFIG="${{ inputs.defconfig || 'k230_canmv_lckfb_defconfig' }}"
+
+          echo ">>> Verifying SDK build actually produced output..."
+          echo "--- Full output/ tree ---"
+          find output/ -maxdepth 3 -type d 2>/dev/null | sort || echo "(output/ empty or missing)"
+
+          echo ""
+          echo "--- output/${DEFCONFIG}/ contents ---"
+          ls -la "output/${DEFCONFIG}/" 2>/dev/null || echo "❌ output/${DEFCONFIG}/ MISSING"
+
+          echo ""
+          echo "--- any defconfig output dirs? ---"
+          ls -d output/*/ 2>/dev/null || echo "(none)"
+
+          echo ""
+          echo "--- toolchain/ dir ---"
+          ls -la toolchain/ 2>/dev/null | head -10 || echo "(toolchain/ missing)"
+
+          if [ ! -d "output/${DEFCONFIG}" ]; then
+            echo ""
+            echo "❌ FATAL: output/${DEFCONFIG}/ does not exist"
+            echo "This means 'make prepare_sourcecode' / 'make CONF=${DEFCONFIG}' did not run or did not succeed."
+            echo "Check the 'Prepare SDK source code' and 'Configure SDK' steps above for errors."
+            exit 1
+          fi
+
+          if [ ! -d "output/${DEFCONFIG}/images" ]; then
+            echo ""
+            echo "❌ FATAL: output/${DEFCONFIG}/images/ does not exist"
+            echo "This means 'make' (build) did not produce kernel/uboot images."
+            echo "Check the 'Build SDK' step above for errors."
+            exit 1
+          fi
+
+          echo "✅ SDK build output verified"
+
       - name: Replace rootfs and configure for Big Core Debian boot
         run: |
           set -e
@@ -452,16 +546,7 @@ jobs:
           DEFCONFIG="${{ inputs.defconfig || 'k230_canmv_lckfb_defconfig' }}"
           IMAGES_DIR="output/${DEFCONFIG}/images"
 
-          echo ">>> Checking images directory exists..."
-          if [ ! -d "${IMAGES_DIR}" ]; then
-            echo "❌ ${IMAGES_DIR} does not exist!"
-            echo "Available output/:"
-            ls -la output/ 2>/dev/null || echo "(output/ missing)"
-            echo "Available output/${DEFCONFIG}/:"
-            ls -la "output/${DEFCONFIG}/" 2>/dev/null || echo "(DEFCONFIG dir missing)"
-            exit 1
-          fi
-          echo "✅ ${IMAGES_DIR} exists"
+          echo "✅ ${IMAGES_DIR} exists (verified in previous step)"
           ls -lh "${IMAGES_DIR}/"
 
           echo ">>> Replacing rootfs with Debian 13..."
@@ -519,15 +604,25 @@ jobs:
             -v "${SDK_DIR}:${BUILD_ROOT}" \
             -v "${SDK_DIR}/toolchain:${TOOLCHAIN_DIR}" \
             -w "${BUILD_ROOT}" \
+            -e DEBIAN_FRONTEND=noninteractive \
             k230_builder \
             bash -c 'set -ex
               echo "=== make build-image ==="
               make build-image
               echo "=== make build-image exit code: $? ==="
+              echo "=== images after build-image ==="
+              ls -lh output/'${DEFCONFIG}'/images/ 2>/dev/null || echo "(images/ missing)"
             '
 
           echo ">>> Build complete! Output files:"
           ls -lh "k230_sdk/output/${DEFCONFIG}/images/"
+
+          if [ ! -f "k230_sdk/output/${DEFCONFIG}/images/sysimage-sdcard.img" ]; then
+            echo "❌ sysimage-sdcard.img was not generated!"
+            ls -la "k230_sdk/output/${DEFCONFIG}/images/" || true
+            exit 1
+          fi
+          echo "✅ sysimage-sdcard.img generated successfully"
 
       - name: Rename and compress final image
         run: |
