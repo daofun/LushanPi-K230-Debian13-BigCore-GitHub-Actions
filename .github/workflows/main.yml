@@ -1,0 +1,561 @@
+name: Build K230 Debian 13 Image for LushanPi (Big Core)
+
+on:
+  workflow_dispatch:
+    inputs:
+      sdk_branch:
+        description: 'K230 Linux SDK branch to use'
+        required: false
+        default: 'main'
+        type: string
+      defconfig:
+        description: 'Board defconfig (LushanPi K230)'
+        required: false
+        default: 'k230_canmv_lckfb_defconfig'
+        type: string
+      debian_mirror:
+        description: 'Debian mirror URL'
+        required: false
+        default: 'https://mirrors.aliyun.com/debian/'
+        type: string
+      image_version:
+        description: 'Custom image version tag'
+        required: false
+        default: 'v0.1.0'
+        type: string
+  push:
+    branches: [ main, master ]
+    paths:
+      - '.github/workflows/build-debian13.yml'
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  SDK_REPO: https://github.com/kendryte/k230_linux_sdk.git
+  TOOLCHAIN_URL: https://github.com/ruyisdk/riscv-gnu-toolchain-rv64ilp32/releases/download/2024.06.25/riscv64ilp32-elf-ubuntu-22.04-gcc-nightly-2024.06.25-nightly.tar.gz
+
+jobs:
+  # ============================================================================
+  # Job 1: Build Debian 13 Root Filesystem (debootstrap)
+  # ============================================================================
+  build-rootfs:
+    runs-on: ubuntu-24.04
+    outputs:
+      rootfs_hash: ${{ steps.hash.outputs.hash }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies for debootstrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-user-static \
+            binfmt-support \
+            debootstrap \
+            debian-archive-keyring \
+            systemd-container \
+            rsync \
+            wget \
+            ca-certificates \
+            git \
+            cpio \
+            xz-utils
+
+      - name: Verify riscv64 binfmt support
+        run: |
+          # riscv64 binfmt is already enabled by qemu-user-static in Ubuntu 24.04
+          echo ">>> Checking riscv64 binfmt support..."
+          if ls /proc/sys/fs/binfmt_misc/qemu-riscv64 >/dev/null 2>&1; then
+            echo "✅ qemu-riscv64 binfmt already registered"
+            cat /proc/sys/fs/binfmt_misc/qemu-riscv64
+          else
+            echo "⚠️ qemu-riscv64 binfmt not found, checking if it can run anyway..."
+            # Check if we can run riscv64 binaries via qemu
+            qemu-riscv64-static --version || true
+          fi
+
+      - name: Download latest debootstrap (for trixie support)
+        run: |
+          # Ubuntu 24.04's debootstrap 1.0.134 supports trixie, but let's make sure
+          # the scripts are up to date by getting them from Debian directly
+          echo ">>> Checking debootstrap version..."
+          dpkg -l debootstrap | tail -1
+
+          # Ensure trixie script exists
+          if [ ! -f /usr/share/debootstrap/scripts/trixie ]; then
+            echo ">>> Downloading trixie script..."
+            sudo wget -q -O /usr/share/debootstrap/scripts/trixie \
+              https://raw.githubusercontent.com/debian-archive/debootstrap/master/scripts/trixie
+          fi
+          ls -la /usr/share/debootstrap/scripts/trixie
+
+      - name: Create Debian 13 (trixie) rootfs via debootstrap
+        run: |
+          set -e
+          ROOTFS_DIR="${{ github.workspace }}/debian13"
+
+          # Clean any previous build
+          sudo rm -rf "${ROOTFS_DIR}"
+
+          # Bootstrap Debian trixie (Debian 13) for riscv64
+          # IMPORTANT: Use debian-archive-keyring (not debian-ports-archive-keyring)
+          # because trixie is now officially released with riscv64 as a standard arch
+          echo ">>> Bootstrapping Debian 13 (trixie) rootfs for riscv64..."
+          sudo debootstrap \
+            --arch=riscv64 \
+            --keyring=/usr/share/keyrings/debian-archive-keyring.gpg \
+            --foreign \
+            trixie \
+            "${ROOTFS_DIR}" \
+            "${{ inputs.debian_mirror || 'https://mirrors.aliyun.com/debian/' }}"
+
+          # Copy qemu-static for second stage
+          echo ">>> Copying qemu-riscv64-static for second stage..."
+          sudo mkdir -p "${ROOTFS_DIR}/usr/bin"
+          sudo cp /usr/bin/qemu-riscv64-static "${ROOTFS_DIR}/usr/bin/"
+          sudo chmod +x "${ROOTFS_DIR}/usr/bin/qemu-riscv64-static"
+
+          # Run second stage inside chroot
+          echo ">>> Running debootstrap second stage..."
+          sudo chroot "${ROOTFS_DIR}" /debootstrap/debootstrap --second-stage
+
+          echo ">>> Rootfs bootstrap complete!"
+
+      - name: Configure rootfs (apt sources, hostname, network, users)
+        run: |
+          set -e
+          ROOTFS_DIR="${{ github.workspace }}/debian13"
+
+          # ---- apt sources (DEB822 format, Debian 13 default) ----
+          cat <<'EOF' | sudo tee "${ROOTFS_DIR}/etc/apt/sources.list.d/debian.sources"
+          Types: deb
+          URIs: http://mirrors.aliyun.com/debian/
+          Suites: trixie trixie-updates trixie-backports
+          Components: main contrib non-free non-free-firmware
+          Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+          Types: deb
+          URIs: http://security.debian.org/debian-security
+          Suites: trixie-security
+          Components: main contrib non-free non-free-firmware
+          Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+          EOF
+
+          # Remove old sources.list to avoid conflicts
+          sudo rm -f "${ROOTFS_DIR}/etc/apt/sources.list"
+
+          # ---- hostname ----
+          echo "k230-lushanpi" | sudo tee "${ROOTFS_DIR}/etc/hostname"
+          cat <<'EOF' | sudo tee "${ROOTFS_DIR}/etc/hosts"
+          127.0.0.1   localhost
+          127.0.1.1   k230-lushanpi
+          ::1         localhost ip6-localhost ip6-loopback
+          EOF
+
+          # ---- timezone ----
+          echo "Asia/Shanghai" | sudo tee "${ROOTFS_DIR}/etc/timezone"
+          sudo chroot "${ROOTFS_DIR}" ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime 2>/dev/null || true
+
+          # ---- fstab ----
+          cat <<'EOF' | sudo tee "${ROOTFS_DIR}/etc/fstab"
+          # <file system>  <mount point>  <type>  <options>  <dump>  <pass>
+          /dev/mmcblk1p5   /              ext4    defaults,noatime  0  1
+          proc             /proc          proc    defaults          0  0
+          sysfs            /sys           sysfs   defaults          0  0
+          devpts           /dev/pts       devpts  defaults          0  0
+          tmpfs            /tmp           tmpfs   defaults          0  0
+          tmpfs            /var/log       tmpfs   defaults,size=64M 0  0
+          EOF
+
+          # ---- Set root password to "root" ----
+          sudo chroot "${ROOTFS_DIR}" bash -c 'echo "root:root" | chpasswd'
+
+          # ---- Enable serial console auto-login ----
+          sudo mkdir -p "${ROOTFS_DIR}/etc/systemd/system/serial-getty@ttyS0.service.d"
+          cat <<'EOF' | sudo tee "${ROOTFS_DIR}/etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf"
+          [Service]
+          ExecStart=
+          ExecStart=-/sbin/agetty --autologin root --noclear %I 115200 linux
+          EOF
+
+          # ---- Create a script to run inside chroot for package installation ----
+          cat <<'CHROOT_SCRIPT' | sudo tee "${ROOTFS_DIR}/chroot_setup.sh"
+          #!/bin/bash
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+          export LC_ALL=C
+
+          # Mount pseudo filesystems (best effort)
+          mount -t proc none /proc 2>/dev/null || true
+          mount -t sysfs none /sys 2>/dev/null || true
+          mount -t devpts devpts /dev/pts 2>/dev/null || true
+
+          # Update package lists
+          apt-get update || true
+
+          # Upgrade
+          apt-get upgrade -y || true
+
+          # Install essential packages for K230 board
+          apt-get install -y --no-install-recommends \
+            systemd \
+            systemd-sysv \
+            udev \
+            dhcpcd5 \
+            net-tools \
+            iputils-ping \
+            wpasupplicant \
+            wireless-tools \
+            iw \
+            openssh-server \
+            openssh-client \
+            sudo \
+            ca-certificates \
+            wget \
+            curl \
+            vim \
+            nano \
+            less \
+            htop \
+            rsync \
+            parted \
+            dosfstools \
+            e2fsprogs \
+            fdisk \
+            gpiod \
+            python3 \
+            python3-pip \
+            python3-venv \
+            usbutils \
+            pciutils \
+            kmod \
+            || true
+
+          # Configure SSH
+          sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config 2>/dev/null || true
+          sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null || true
+
+          # Enable systemd-networkd for ethernet
+          systemctl enable systemd-networkd 2>/dev/null || true
+          systemctl enable systemd-resolved 2>/dev/null || true
+
+          # Configure DHCP for eth0
+          mkdir -p /etc/systemd/network
+          cat > /etc/systemd/network/eth0.network <<'NETEOF'
+          [Match]
+          Name=eth0
+
+          [Network]
+          DHCP=yes
+          NETEOF
+
+          # Clean apt cache
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+
+          # Unmount pseudo filesystems
+          umount /proc 2>/dev/null || true
+          umount /sys 2>/dev/null || true
+          umount /dev/pts 2>/dev/null || true
+
+          echo "Chroot setup complete!"
+          CHROOT_SCRIPT
+
+          sudo chmod +x "${ROOTFS_DIR}/chroot_setup.sh"
+
+          # ---- Run chroot script ----
+          echo ">>> Running chroot package installation..."
+          sudo chroot "${ROOTFS_DIR}" /chroot_setup.sh || {
+            echo "Chroot script failed, but continuing..."
+          }
+
+          # Clean up
+          sudo rm -f "${ROOTFS_DIR}/chroot_setup.sh"
+          sudo rm -f "${ROOTFS_DIR}/usr/bin/qemu-riscv64-static"
+
+      - name: Generate rootfs ext4 image
+        run: |
+          set -e
+          ROOTFS_DIR="${{ github.workspace }}/debian13"
+          OUTPUT_DIR="${{ github.workspace }}/output"
+          mkdir -p "${OUTPUT_DIR}"
+
+          # Calculate size: 1.5GB rootfs
+          ROOTFS_SIZE="1536M"
+          ROOTFS_IMG="${OUTPUT_DIR}/debian13_rootfs.ext4"
+
+          echo ">>> Creating ext4 image: ${ROOTFS_IMG} (${ROOTFS_SIZE})"
+          sudo mkfs.ext4 -d "${ROOTFS_DIR}" -r 1 -N 0 -m 1 -L "rootfs" -O ^64bit "${ROOTFS_IMG}" "${ROOTFS_SIZE}"
+
+          # Compress rootfs
+          echo ">>> Compressing rootfs..."
+          cd "${OUTPUT_DIR}"
+          tar -czvf "debian13_rootfs.ext4.tar.gz" "debian13_rootfs.ext4"
+
+          # Generate checksum
+          sha256sum "debian13_rootfs.ext4" > "debian13_rootfs.ext4.sha256"
+          sha256sum "debian13_rootfs.ext4.tar.gz" > "debian13_rootfs.ext4.tar.gz.sha256"
+
+          ls -lh "${OUTPUT_DIR}/"
+
+      - name: Upload rootfs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian13-rootfs
+          path: |
+            output/debian13_rootfs.ext4
+            output/debian13_rootfs.ext4.tar.gz
+            output/debian13_rootfs.ext4.sha256
+            output/debian13_rootfs.ext4.tar.gz.sha256
+          retention-days: 30
+
+      - name: Generate rootfs hash
+        id: hash
+        run: |
+          HASH=$(sha256sum output/debian13_rootfs.ext4 | awk '{print $1}')
+          echo "hash=${HASH}" >> $GITHUB_OUTPUT
+          echo "Rootfs SHA256: ${HASH}"
+
+  # ============================================================================
+  # Job 2: Build K230 SDK (kernel, uboot, opensbi) using Docker
+  # ============================================================================
+  build-sdk:
+    runs-on: ubuntu-24.04
+    needs: build-rootfs
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Clone K230 Linux SDK
+        run: |
+          SDK_BRANCH="${{ inputs.sdk_branch || 'main' }}"
+          echo ">>> Cloning K230 Linux SDK (branch: ${SDK_BRANCH})..."
+          git clone --depth=1 -b "${SDK_BRANCH}" "${SDK_REPO}" k230_sdk
+          ls -la k230_sdk/
+
+      - name: Install Docker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker.io
+          sudo systemctl start docker
+          sudo usermod -aG docker $USER
+          docker --version
+
+      - name: Build SDK Docker image
+        run: |
+          cd k230_sdk
+          echo ">>> Building K230 SDK Docker image..."
+          docker build -f tools/docker/Dockerfile -t k230_builder tools/docker
+
+      - name: Prepare SDK source code inside Docker
+        run: |
+          cd k230_sdk
+          echo ">>> Preparing source code..."
+          docker run --rm \
+            -u root \
+            -v $(pwd):$(pwd) \
+            -w $(pwd) \
+            k230_builder \
+            bash -c "source tools/get_download_url.sh && make prepare_sourcecode"
+
+      - name: Configure SDK for LushanPi K230 (Big Core Linux only)
+        run: |
+          cd k230_sdk
+          DEFCONFIG="${{ inputs.defconfig || 'k230_canmv_lckfb_defconfig' }}"
+          echo ">>> Configuring SDK with: ${DEFCONFIG}"
+          docker run --rm \
+            -u root \
+            -v $(pwd):$(pwd) \
+            -v $(pwd)/toolchain:/opt/toolchain \
+            -w $(pwd) \
+            k230_builder \
+            bash -c "make CONF=${DEFCONFIG}"
+
+      - name: Build SDK (kernel, uboot, opensbi)
+        run: |
+          cd k230_sdk
+          echo ">>> Building SDK..."
+          docker run --rm \
+            -u root \
+            -v $(pwd):$(pwd) \
+            -v $(pwd)/toolchain:/opt/toolchain \
+            -w $(pwd) \
+            k230_builder \
+            bash -c "make -j$(nproc)"
+
+      - name: Download rootfs artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: debian13-rootfs
+          path: k230_sdk/output/rootfs_artifact
+
+      - name: Replace rootfs and configure for Big Core Debian boot
+        run: |
+          set -e
+          cd k230_sdk
+          DEFCONFIG="${{ inputs.defconfig || 'k230_canmv_lckfb_defconfig' }}"
+          IMAGES_DIR="output/${DEFCONFIG}/images"
+
+          echo ">>> Replacing rootfs with Debian 13..."
+          # Extract Debian rootfs ext4 from artifact
+          tar -xvf output/rootfs_artifact/debian13_rootfs.ext4.tar.gz -C "${IMAGES_DIR}/"
+
+          # Modify genimage config to use debian rootfs
+          echo ">>> Patching genimage-sdcard.cfg for Debian rootfs..."
+          GENIMAGE_CFG="board/common/gen_image_cfg/genimage-sdcard.cfg"
+          if grep -q "partition debian" "${GENIMAGE_CFG}" 2>/dev/null; then
+            echo "Debian partition already configured."
+          else
+            # Add debian rootfs partition config
+            cat >> "${GENIMAGE_CFG}" <<'EOF'
+
+            partition debian {
+                image = "debian13_rootfs.ext4"
+            }
+            EOF
+          fi
+
+          # Modify bootcmd in default.env for Debian rootfs on mmcblk1p5
+          echo ">>> Patching default.env bootcmd for Big Core..."
+          DEFAULT_ENV="board/common/env/default.env"
+          sed -i 's|^bootcmd=.*|bootcmd=setenv bootargs "root=/dev/mmcblk1p5 loglevel=8 rw rootdelay=4 rootfstype=ext4 console=ttyS0,115200 earlycon=sbi";k230_boot auto auto_boot;|' "${DEFAULT_ENV}"
+
+          echo ">>> Patched files:"
+          echo "--- genimage-sdcard.cfg ---"
+          tail -10 "${GENIMAGE_CFG}"
+          echo "--- default.env ---"
+          grep "^bootcmd=" "${DEFAULT_ENV}"
+
+      - name: Build final SD card image
+        run: |
+          set -e
+          cd k230_sdk
+          DEFCONFIG="${{ inputs.defconfig || 'k230_canmv_lckfb_defconfig' }}"
+          echo ">>> Building final SD card image..."
+          docker run --rm \
+            -u root \
+            -v $(pwd):$(pwd) \
+            -v $(pwd)/toolchain:/opt/toolchain \
+            -w $(pwd) \
+            k230_builder \
+            bash -c "make build-image"
+
+          echo ">>> Build complete! Output files:"
+          ls -lh "output/${DEFCONFIG}/images/"
+
+      - name: Rename and compress final image
+        run: |
+          set -e
+          cd k230_sdk
+          DEFCONFIG="${{ inputs.defconfig || 'k230_canmv_lckfb_defconfig' }}"
+          IMAGES_DIR="output/${DEFCONFIG}/images"
+          VERSION="${{ inputs.image_version || 'v0.1.0' }}"
+          DATE=$(date +%Y%m%d)
+
+          # Find the generated sdcard image
+          IMG_FILE=$(find "${IMAGES_DIR}" -name "sysimage-sdcard.img" | head -1)
+          if [ -z "${IMG_FILE}" ]; then
+            echo "ERROR: sysimage-sdcard.img not found!"
+            ls -la "${IMAGES_DIR}/"
+            exit 1
+          fi
+
+          # Rename to meaningful name
+          FINAL_NAME="LushanPi-K230_Debian13_bigcore_${VERSION}_${DATE}.img"
+          cp "${IMG_FILE}" "${IMAGES_DIR}/${FINAL_NAME}"
+
+          # Compress
+          gzip -k -f "${IMAGES_DIR}/${FINAL_NAME}"
+          mv "${IMAGES_DIR}/${FINAL_NAME}.gz" "output/${FINAL_NAME}.img.gz"
+
+          # Also copy the uncompressed image
+          cp "${IMAGES_DIR}/${FINAL_NAME}" "output/${FINAL_NAME}.img"
+
+          # Generate checksums
+          cd output
+          sha256sum "${FINAL_NAME}.img" > "${FINAL_NAME}.img.sha256"
+          sha256sum "${FINAL_NAME}.img.gz" > "${FINAL_NAME}.img.gz.sha256"
+          md5sum "${FINAL_NAME}.img.gz" > "${FINAL_NAME}.img.gz.md5"
+
+          echo ">>> Final artifacts:"
+          ls -lh output/
+
+      - name: Upload final image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LushanPi-K230-Debian13-bigcore
+          path: |
+            output/*.img
+            output/*.img.gz
+            output/*.sha256
+            output/*.md5
+          retention-days: 30
+
+  # ============================================================================
+  # Job 3: Release (only on tag push or manual dispatch)
+  # ============================================================================
+  release:
+    runs-on: ubuntu-24.04
+    needs: [build-rootfs, build-sdk]
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -name "*.img.gz" -exec cp {} release/ \;
+          find artifacts -name "*.img" -exec cp {} release/ \;
+          find artifacts -name "*.sha256" -exec cp {} release/ \;
+          find artifacts -name "*.md5" -exec cp {} release/ \;
+          ls -lh release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          name: "LushanPi K230 Debian 13 (Big Core) ${{ inputs.image_version || github.ref_name }}"
+          body: |
+            ## 🐧 LushanPi K230 Debian 13 Image (Big Core)
+
+            ### Features
+            - Debian 13 (trixie) running on K230 **Big Core** (CPU1, 1.6GHz RISC-V C908 with RVV 1.0)
+            - Full apt package management
+            - Pre-configured for LushanPi K230 board
+            - Serial console auto-login (root/root)
+            - SSH enabled (root/root)
+            - DHCP enabled for Ethernet
+            - WiFi support (RTL8189)
+            - GPIO tools pre-installed
+
+            ### Flashing
+            ```bash
+            # Linux
+            sudo dd if=LushanPi-K230_Debian13_bigcore_*.img of=/dev/sdX bs=1M oflag=sync
+
+            # Windows: Use Balena Etcher or Rufus
+            ```
+
+            ### Login
+            - **Serial**: 115200 8N1, root/root
+            - **SSH**: root@<board-ip>, root/root
+
+            ### Verify Checksum
+            ```bash
+            sha256sum -c *.img.sha256
+            ```
+
+            ---
+            *Auto-built by GitHub Actions*
+          draft: false
+          prerelease: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
