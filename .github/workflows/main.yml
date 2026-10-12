@@ -337,25 +337,42 @@ jobs:
           git clone --depth=1 -b "${SDK_BRANCH}" "${SDK_REPO}" k230_sdk
           ls -la k230_sdk/
 
-      - name: Install Docker
+      - name: Setup Docker (use runner's pre-installed Docker)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo usermod -aG docker $USER
-          docker --version
+          # Ubuntu 24.04 runner already has Docker pre-installed
+          # Just ensure the service is running and current user can use it
+          if ! command -v docker &> /dev/null; then
+            echo ">>> Docker not found, installing..."
+            sudo apt-get update
+            sudo apt-get install -y docker.io
+          else
+            echo ">>> Docker already installed:"
+            docker --version
+          fi
+
+          # Ensure docker service is running
+          if ! sudo systemctl is-active --quiet docker; then
+            sudo systemctl start docker
+          fi
+
+          # Add current user to docker group (for current session, use sudo for docker commands)
+          sudo usermod -aG docker $USER || true
+
+          # Verify
+          sudo docker --version
+          sudo docker info --format '{{.ServerVersion}}' || true
 
       - name: Build SDK Docker image
         run: |
           cd k230_sdk
           echo ">>> Building K230 SDK Docker image..."
-          docker build -f tools/docker/Dockerfile -t k230_builder tools/docker
+          sudo docker build -f tools/docker/Dockerfile -t k230_builder tools/docker
 
       - name: Prepare SDK source code inside Docker
         run: |
           cd k230_sdk
           echo ">>> Preparing source code..."
-          docker run --rm \
+          sudo docker run --rm \
             -u root \
             -v $(pwd):$(pwd) \
             -w $(pwd) \
@@ -367,7 +384,7 @@ jobs:
           cd k230_sdk
           DEFCONFIG="${{ inputs.defconfig || 'k230_canmv_lckfb_defconfig' }}"
           echo ">>> Configuring SDK with: ${DEFCONFIG}"
-          docker run --rm \
+          sudo docker run --rm \
             -u root \
             -v $(pwd):$(pwd) \
             -v $(pwd)/toolchain:/opt/toolchain \
@@ -379,7 +396,7 @@ jobs:
         run: |
           cd k230_sdk
           echo ">>> Building SDK..."
-          docker run --rm \
+          sudo docker run --rm \
             -u root \
             -v $(pwd):$(pwd) \
             -v $(pwd)/toolchain:/opt/toolchain \
@@ -436,7 +453,7 @@ jobs:
           cd k230_sdk
           DEFCONFIG="${{ inputs.defconfig || 'k230_canmv_lckfb_defconfig' }}"
           echo ">>> Building final SD card image..."
-          docker run --rm \
+          sudo docker run --rm \
             -u root \
             -v $(pwd):$(pwd) \
             -v $(pwd)/toolchain:/opt/toolchain \
